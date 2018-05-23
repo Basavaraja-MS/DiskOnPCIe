@@ -12,10 +12,86 @@
 
 #include "ram_device.h"
 
+#include <linux/pci.h>
+
 #define RB_FIRST_MINOR 0
 #define RB_MINOR_CNT 16
 
 static u_int rb_major = 0;
+
+#define PCI_VENDOR_ID_CDNS      0x17CD
+#define PCI_DEVICE_ID_CDNS      0x0100
+static struct gendisk *local_rb_disk;
+
+static int cdns_pci_probe(struct pci_dev *dev, const struct pci_device_id *id);
+static void cdns_pci_remove(struct pci_dev *dev);
+
+
+static const struct pci_device_id cdns_ids[ ] = {
+        { PCI_DEVICE(PCI_VENDOR_ID_CDNS, PCI_DEVICE_ID_CDNS) },
+};
+
+static struct pci_driver pci_driver = {
+        .name = "pci_cdns",
+        .id_table = cdns_ids,
+        .probe = cdns_pci_probe,
+        .remove = cdns_pci_remove,
+};
+
+
+enum bars {bar0, bar1, bar2, bar3, bar4, bar5};
+void __iomem *bar0base;
+static int cdns_pci_probe(struct pci_dev *dev, const struct pci_device_id *id){
+        int retval, bars;
+        u16 u16data;
+
+        printk("CDNS pobed\n");
+        bars = pci_select_bars(dev, IORESOURCE_MEM);
+        printk ("CDNS bars retval 0x%x\n", bars);
+
+        if (pci_request_region(dev, bar0,"cdn_pci_driver")==0)
+                printk("CDNS region requested properly\n");
+        else{
+                printk("CDNS Error coudnt allocate regions\n");
+                return -1;
+        }
+
+        bar0base = pci_iomap(dev, bar0, 0);
+        pci_set_master(dev);
+
+        retval = pci_enable_device(dev);
+        if (retval < 0){
+                printk("CDNS Enable pci device failed\n");
+                goto devicedel;
+        }
+
+        u16data = readw(bar0base);
+        printk("CDNS u16data 0x0 - 0x%x\n", u16data);
+	if ((retval = pci_ramdevice_init(bar0base)) < 0)
+	{
+		printk("CDNS Error in ramdevice init");
+		return retval;
+	}
+	/* Adding the disk to the system */
+	add_disk(local_rb_disk);
+
+
+        return 0;
+
+devicedel:
+	pci_disable_device(dev);
+	pci_iounmap(dev, bar0base);
+	pci_release_regions(dev);
+        return -1;
+}
+
+static void cdns_pci_remove(struct pci_dev *dev){
+	pci_disable_device(dev);
+        pci_iounmap(dev, bar0base);
+        pci_release_regions(dev);
+}
+
+
 
 /* 
  * The internal structure representation of our Device
@@ -30,6 +106,8 @@ static struct rb_device
 	struct request_queue *rb_queue;
 	/* This is kernel's representation of an individual disk device */
 	struct gendisk *rb_disk;
+	/*PCIe devoice */
+	struct pci_dev *pdev;
 } rb_dev;
 
 static int rb_open(struct block_device *bdev, fmode_t mode)
@@ -115,11 +193,11 @@ static int rb_transfer(struct request *req)
 			(unsigned long long)(start_sector), (unsigned long long)(sector_offset), buffer, sectors);
 		if (dir == WRITE) /* Write to the device */
 		{
-			ramdevice_write(start_sector + sector_offset, buffer, sectors);
+			pci_ramdevice_write(start_sector + sector_offset, buffer, sectors);
 		}
 		else /* Read from the device */
 		{
-			ramdevice_read(start_sector + sector_offset, buffer, sectors);
+			pci_ramdevice_read(start_sector + sector_offset, buffer, sectors);
 		}
 		sector_offset += sectors;
 	}
@@ -181,13 +259,15 @@ static struct block_device_operations rb_fops =
 static int __init rb_init(void)
 {
 	int ret;
-
+#if 0
 	/* Set up our RAM Device */
 	if ((ret = ramdevice_init()) < 0)
 	{
 		return ret;
 	}
-	rb_dev.size = ret;
+	rb_dev.size = ret; 
+#endif
+	rb_dev.size = 1024; 
 
 	/* Get Registered */
 	rb_major = register_blkdev(rb_major, "rb");
@@ -234,6 +314,9 @@ static int __init rb_init(void)
  	/* Driver-specific own internal data */
 	rb_dev.rb_disk->private_data = &rb_dev;
 	rb_dev.rb_disk->queue = rb_dev.rb_queue;
+
+	local_rb_disk = rb_dev.rb_disk;
+
 	/*
 	 * You do not want partition information to show up in 
 	 * cat /proc/partitions set this flags
@@ -243,12 +326,23 @@ static int __init rb_init(void)
 	/* Setting the capacity of the device in its gendisk structure */
 	set_capacity(rb_dev.rb_disk, rb_dev.size);
 
+        if (pci_register_driver(&pci_driver) < 0){
+                printk("CDNS: Error in pci_rigister\n");
+		blk_cleanup_queue(rb_dev.rb_queue);
+		unregister_blkdev(rb_major, "rb");
+		ramdevice_cleanup();
+		return -ENOMEM;
+
+        }
+
+
+#if 0
 	/* Adding the disk to the system */
 	add_disk(rb_dev.rb_disk);
 	/* Now the disk is "live" */
 	printk(KERN_INFO "rb: Ram Block driver initialised (%d sectors; %d bytes)\n",
 		rb_dev.size, rb_dev.size * RB_SECTOR_SIZE);
-
+#endif
 	return 0;
 }
 /*
@@ -257,6 +351,7 @@ static int __init rb_init(void)
  */
 static void __exit rb_cleanup(void)
 {
+	pci_unregister_driver(&pci_driver);
 	del_gendisk(rb_dev.rb_disk);
 	put_disk(rb_dev.rb_disk);
 	blk_cleanup_queue(rb_dev.rb_queue);
@@ -268,6 +363,5 @@ module_init(rb_init);
 module_exit(rb_cleanup);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Anil Kumar Pugalia <email@sarika-pugs.com>");
 MODULE_DESCRIPTION("Ram Block Driver");
 MODULE_ALIAS_BLOCKDEV_MAJOR(rb_major);

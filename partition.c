@@ -1,8 +1,7 @@
 #include <linux/string.h>
-
+#include <linux/io.h>
 #include "partition.h"
 
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof(*a))
 
 #define SECTOR_SIZE 512
 #define MBR_SIZE SECTOR_SIZE
@@ -174,3 +173,47 @@ void copy_mbr_n_br(u8 *disk)
 		copy_br(disk, def_log_part_br_cyl[i], &def_log_part_table[i]);
 	}
 }
+
+#define PCI_SIZE 4
+static void pci_copy_mbr(void __iomem *disk)
+{
+        int indx, i;
+        for (indx = 0; indx < MBR_SIZE ;indx +=  PCI_SIZE){
+                iowrite32(0x0, disk);
+        }
+        iowrite32(0x36E5756D, disk + MBR_DISK_SIGNATURE_OFFSET);
+        for (indx = PARTITION_TABLE_OFFSET, i = 0;
+                        indx < PARTITION_TABLE_OFFSET + PARTITION_TABLE_SIZE;
+                                indx += 2, i++){
+                iowrite16(*((u16 *)&def_part_table + i), disk + indx);
+        }
+        iowrite16(MBR_SIGNATURE, disk + MBR_SIGNATURE_OFFSET);
+}
+
+static void pci_copy_br(void __iomem *disk, int start_cylinder, const PartTable *part_table)
+{
+    int index, i =0;
+    int addr = start_cylinder * 32 * SECTOR_SIZE;
+    for (index = addr; index < BR_SIZE; index += PCI_SIZE){
+        iowrite32(0x0, disk + index);
+    }
+    for (index = addr + PARTITION_TABLE_OFFSET, i = 0;
+                        index < addr + PARTITION_TABLE_OFFSET + PARTITION_TABLE_SIZE;
+                                index += 2, i++){
+        iowrite16(*((u16 *)part_table + i), disk + index);
+    }
+    iowrite16(BR_SIGNATURE, disk + BR_SIGNATURE_OFFSET);
+}
+
+void pci_copy_mbr_n_br(void __iomem *disk)
+{
+    int i;
+
+    pci_copy_mbr(disk);
+    for (i = 0; i < ARRAY_SIZE(def_log_part_table); i++)
+    {
+        pci_copy_br(disk, def_log_part_br_cyl[i], &def_log_part_table[i]);
+    }
+    printk("CDNS pci_copy_mbr_n_br sucess\n");
+}
+
